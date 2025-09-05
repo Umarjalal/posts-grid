@@ -3,6 +3,7 @@
     font-family: "Oswald", Sans-serif !important;
     max-width: 100%;
     margin: 0 auto;
+    contain: layout style; /* CSS containment for better performance */
 }
 
 /* ACF Filter No Options Message */
@@ -24,6 +25,7 @@
     padding: 20px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
     animation: skeleton-pulse 1.5s ease-in-out infinite;
+    will-change: opacity; /* Optimize for animations */
 }
 
 /* Skeleton Layout Variations */
@@ -81,6 +83,7 @@
     background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
     border-radius: 6px;
     margin-bottom: 15px;
+    will-change: background-position; /* Optimize shimmer animation */
 }
 
 .gpw-skeleton-title {
@@ -89,6 +92,7 @@
     background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
     border-radius: 4px;
     margin-bottom: 15px;
+    will-change: background-position;
 }
 
 .gpw-skeleton-line {
@@ -97,6 +101,7 @@
     background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
     border-radius: 4px;
     margin-bottom: 10px;
+    will-change: background-position;
 }
 
 .gpw-skeleton-line:last-child {
@@ -115,12 +120,23 @@
     height: 16px;
     background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
     border-radius: 4px;
+    will-change: background-position;
 }
 
 @keyframes skeleton-pulse {
     0% { opacity: 1; }
     50% { opacity: 0.7; }
     100% { opacity: 1; }
+}
+
+/* Optimized shimmer animation */
+@keyframes skeleton-shimmer {
+    0% {
+        background-position: -200% 0;
+    }
+    100% {
+        background-position: 200% 0;
+    }
 }
 
 /* Search Section */
@@ -267,6 +283,8 @@
     top: 0;
     transform: translateX(200%);
     transition: transform 0.3s ease;
+    backface-visibility: hidden; /* Optimize transforms */
+    will-change: transform;
 }
 
 .gpw-filters-wrapper.active {
@@ -620,6 +638,7 @@
     letter-spacing: 0.5px;
     white-space: nowrap;
     position: relative;
+    will-change: background-color, border-color; /* Optimize hover effects */
 }
 
 /* Filters Applied Indicator Dot */
@@ -634,6 +653,7 @@
     position: absolute;
     top: 0;
     right: 0;
+    will-change: transform, opacity; /* Optimize pulse animation */
 }
 
 @keyframes pulse {
@@ -893,6 +913,7 @@
     display: grid;
     gap: 30px;
     margin-bottom: 30px;
+    contain: layout; /* CSS containment for grid performance */
 }
 
 /* Desktop Grid Columns */
@@ -935,6 +956,7 @@
     height: fit-content;
     display: flex;
     flex-direction: column;
+    will-change: transform, box-shadow; /* Optimize hover effects */
 }
 
 .gpw-post:hover {
@@ -1018,10 +1040,11 @@
 	min-width: 48px;
     height: 48px;
     border-radius: 99px;
-	display: flex;
+    display: flex;
     align-items: center;
     justify-content: center;
-    transition: 0.3s;
+    transition: background-color 0.3s, border-color 0.3s; /* Specific transitions for better performance */
+    will-change: background-color, border-color;
 }
 
 .gpw-page:hover {
@@ -1318,6 +1341,7 @@
 /* Animation for new posts (infinite scroll) */
 .gpw-post {
     animation: fadeInUp 0.5s ease-out;
+    will-change: opacity, transform; /* Optimize fade-in animation */
 }
 
 @keyframes fadeInUp {
@@ -1354,6 +1378,29 @@
     
     .gpw-page {
         border: 2px solid #000;
+    }
+}
+
+/* Reduce motion for accessibility */
+@media (prefers-reduced-motion: reduce) {
+    .gpw-skeleton-card,
+    .gpw-skeleton-image,
+    .gpw-skeleton-title,
+    .gpw-skeleton-line,
+    .gpw-skeleton-date,
+    .gpw-skeleton-category,
+    .gpw-filters-indicator,
+    .gpw-post {
+        animation: none;
+    }
+    
+    .gpw-filters-wrapper {
+        transition: none;
+    }
+    
+    .gpw-page,
+    .gpw-post {
+        transition: none;
     }
 }
 
@@ -1483,9 +1530,10 @@
   border: none;
   outline: none;
   background-color: transparent;
-  transition: background-color 0.3s, color 0.3s;
+  transition: background-color 0.2s ease, color 0.2s ease; /* Faster, smoother transitions */
   font-size: 20px;
   border-radius: 6px;
+  will-change: background-color, color; /* Optimize theme switching */
 }
 
 .toggle-btn.active {
@@ -1510,6 +1558,7 @@
   background-color: #0b141a !important;
   width: 108px;
   height: 56px;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
 }
 .light-theme .toggle-btn.inactive{
     background-color: white !important;
@@ -1519,8 +1568,9 @@
 .light-theme .toggle-container {
   border-color: #EBEDEE !important;
   background-color: white !important;
-    width: 108px;
+  width: 108px;
   height: 56px;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
 }
 .light-theme #lightToggle svg path{
     stroke: white !important;
@@ -1727,9 +1777,25 @@
 }
 
 .dark-theme .gpw-date-input label{
-	color: white !important;
+    color: white !important;
 }
 
+/* Performance optimizations for theme switching */
+.light-theme,
+.dark-theme {
+    transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* Optimize frequently changed elements */
+.gpw-page,
+.gpw-search,
+.gpw-show-filters-btn,
+.gpw-selected-tag,
+.gpw-confirm-filters,
+.gpw-reset-filters {
+    transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    will-change: background-color, color, border-color;
+}
 
 /*  */ 
 
@@ -1769,4 +1835,29 @@ input[type="date"]::-moz-calendar-picker-indicator {
   transform: translateY(-50%);
   font-size: 18px; 
   pointer-events: none; 
+}
+
+/* Critical CSS for above-the-fold content */
+.gpw-wrapper {
+    min-height: 200px; /* Prevent layout shift */
+}
+
+.gpw-posts-grid {
+    min-height: 300px; /* Prevent layout shift during loading */
+}
+
+/* Optimize images */
+.gpw-post img {
+    height: auto;
+    max-width: 100%;
+    object-fit: cover;
+    loading: lazy;
+    decoding: async;
+}
+
+/* GPU acceleration for smooth animations */
+.gpw-filters-wrapper,
+.gpw-post,
+.gpw-skeleton-card {
+    transform: translateZ(0); /* Force GPU acceleration */
 }
