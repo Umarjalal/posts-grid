@@ -6,54 +6,90 @@ jQuery(document).ready(function($) {
     let pendingFilters = {};
     let appliedFilters = {};
 
-let currentRequest = null;
-let postsCache = {};
+    let currentRequest = null;
+    let postsCache = new Map(); // Use Map for better performance
+    let searchTimeout = null;
 
-function getCacheKey(settings, filters, paged) {
-    return JSON.stringify({settings, filters, paged});
-}
-
-function loadPosts($wrapper, paged = 1, append = false) {
-    let settings = $wrapper.data('settings');
-
-    // --- 0. Show skeleton immediately (before anything else) ---
-    if (!append && settings.show_skeleton === 'yes') {
-        let postsPerPage = settings.posts_per_page || 6;
-        let skeletonHtml = generateSkeletonCards(postsPerPage, settings);
-        $wrapper.find('.gpw-posts-grid').html(skeletonHtml);
+    // Optimized cache key generation
+    function getCacheKey(settings, filters, paged) {
+        return `${settings.post_type}-${settings.posts_per_page}-${paged}-${JSON.stringify(filters)}`;
     }
 
-    // Build cache key
-    let cacheKey = getCacheKey(settings, appliedFilters, paged);
+    // Optimized skeleton generation with template literals
+    function generateSkeletonCards(count, settings) {
+        if (settings.show_skeleton !== 'yes') return '';
+        
+        const layoutClass = settings.skeleton_layout || 'image-top';
+        const skeletonImage = settings.skeleton_image === 'yes' ? '<div class="gpw-skeleton-image"></div>' : '';
+        const skeletonContent = generateSkeletonContent(settings);
+        
+        return Array.from({length: count}, () => 
+            `<div class="gpw-skeleton-card gpw-skeleton-${layoutClass}">
+                ${skeletonImage}
+                <div class="gpw-skeleton-content">${skeletonContent}</div>
+            </div>`
+        ).join('');
+    }
 
-    // --- 1. Return from cache if available ---
-    if (postsCache[cacheKey]) {
-        if (append) {
-            $wrapper.find('.gpw-posts-grid').append(postsCache[cacheKey].html);
-        } else {
-            $wrapper.find('.gpw-posts-grid').html(postsCache[cacheKey].html);
+    function generateSkeletonContent(settings) {
+        const contentOrder = settings.skeleton_content_order?.length > 0 
+            ? settings.skeleton_content_order 
+            : [{element: 'title'}, {element: 'excerpt'}, {element: 'meta'}];
+        
+        return contentOrder.map(item => {
+            switch(item.element) {
+                case 'title':
+                    return settings.skeleton_title === 'yes' ? '<div class="gpw-skeleton-title"></div>' : '';
+                case 'excerpt':
+                    return settings.skeleton_excerpt === 'yes' 
+                        ? `<div class="gpw-skeleton-excerpt">${generateSkeletonLines(settings.skeleton_lines || 3)}</div>` 
+                        : '';
+                case 'meta':
+                    return settings.skeleton_meta === 'yes' 
+                        ? '<div class="gpw-skeleton-meta"><div class="gpw-skeleton-date"></div><div class="gpw-skeleton-category"></div></div>' 
+                        : '';
+                default:
+                    return '';
+            }
+        }).join('');
+    }
+
+    function generateSkeletonLines(count) {
+        return Array.from({length: count}, () => '<div class="gpw-skeleton-line"></div>').join('');
+    }
+
+    // Optimized loadPosts function with better error handling
+    function loadPosts($wrapper, paged = 1, append = false) {
+        if (loading && !append) return;
+        loading = true;
+
+        const settings = $wrapper.data('settings');
+        const cacheKey = getCacheKey(settings, appliedFilters, paged);
+
+        // Show skeleton immediately for better UX
+        if (!append && settings.show_skeleton === 'yes') {
+            const postsPerPage = settings.posts_per_page || 6;
+            const skeletonHtml = generateSkeletonCards(postsPerPage, settings);
+            $wrapper.find('.gpw-posts-grid').html(skeletonHtml);
         }
-        maxPages = postsCache[cacheKey].max_pages;
-        currentPage = postsCache[cacheKey].current_page;
 
-        if (settings.show_pagination === 'yes') {
-            updatePagination($wrapper, postsCache[cacheKey]);
+        // Return from cache if available
+        if (postsCache.has(cacheKey)) {
+            const cachedData = postsCache.get(cacheKey);
+            updatePostsDisplay($wrapper, cachedData, append);
+            loading = false;
+            return;
         }
-        updateResultsCount($wrapper, postsCache[cacheKey].found_posts);
-        return;
-    }
 
-    // --- 2. Cancel old request if still running ---
-    if (currentRequest) {
-        currentRequest.abort();
-    }
+        // Cancel previous request
+        if (currentRequest) {
+            currentRequest.abort();
+        }
 
-    // --- 3. Fire new AJAX request ---
-    currentPage = paged;
-    currentRequest = $.ajax({
-        url: GPW_Ajax.ajax_url,
-        type: 'POST',
-        data: {
+        currentPage = paged;
+        
+        // Prepare AJAX data
+        const ajaxData = {
             action: 'gpw_filter_posts',
             nonce: GPW_Ajax.nonce,
             post_type: settings.post_type,
@@ -69,53 +105,76 @@ function loadPosts($wrapper, paged = 1, append = false) {
             search_in_title: settings.search_in_title || 'yes',
             search_in_content: settings.search_in_content || 'yes',
             search_in_acf: settings.search_in_acf || 'yes'
-        },
-        success: function(res) {
-            if (res.success) {
-                // --- 4. Save in cache ---
-                postsCache[cacheKey] = res.data;
+        };
 
-                // --- 5. Replace skeleton with posts ---
-                if (append) {
-                    $wrapper.find('.gpw-posts-grid').append(res.data.html);
-                } else {
-                    $wrapper.find('.gpw-posts-grid').html(res.data.html);
+        currentRequest = $.ajax({
+            url: GPW_Ajax.ajax_url,
+            type: 'POST',
+            data: ajaxData,
+            success: function(res) {
+                if (res.success) {
+                    // Cache the result
+                    postsCache.set(cacheKey, res.data);
+                    
+                    // Limit cache size to prevent memory issues
+                    if (postsCache.size > 50) {
+                        const firstKey = postsCache.keys().next().value;
+                        postsCache.delete(firstKey);
+                    }
+                    
+                    updatePostsDisplay($wrapper, res.data, append);
                 }
-
-                maxPages = res.data.max_pages;
-                currentPage = res.data.current_page;
-
-                if (settings.show_pagination === 'yes') {
-                    updatePagination($wrapper, res.data);
+            },
+            error: function(xhr, status) {
+                if (status !== "abort" && !append) {
+                    showErrorState($wrapper);
                 }
-                updateResultsCount($wrapper, res.data.found_posts);
+            },
+            complete: function() {
+                currentRequest = null;
+                loading = false;
+                $wrapper.find('.gpw-loading').remove();
             }
-        },
-        error: function(xhr, status) {
-            if (status !== "abort" && !append) {
-                $wrapper.find('.gpw-posts-grid').html(`
-                    <div class="gpw-error">
-                        <div class="gpw-error-icon">⚠️</div>
-                        <div class="gpw-error-title">Error Loading Posts</div>
-                        <div class="gpw-error-message">Please try again or refresh the page.</div>
-                        <button class="gpw-error-retry" onclick="location.reload()">Retry</button>
-                    </div>
-                `);
-            }
-        },
-        complete: function() {
-            currentRequest = null;
-            $wrapper.find('.gpw-loading').remove();
+        });
+    }
+
+    // Separate function for updating posts display
+    function updatePostsDisplay($wrapper, data, append) {
+        const $postsGrid = $wrapper.find('.gpw-posts-grid');
+        
+        if (append) {
+            $postsGrid.append(data.html);
+        } else {
+            $postsGrid.html(data.html);
         }
-    });
-}
 
+        maxPages = data.max_pages;
+        currentPage = data.current_page;
 
+        const settings = $wrapper.data('settings');
+        if (settings.show_pagination === 'yes') {
+            updatePagination($wrapper, data);
+        }
+        updateResultsCount($wrapper, data.found_posts);
+    }
 
+    // Optimized error state display
+    function showErrorState($wrapper) {
+        $wrapper.find('.gpw-posts-grid').html(`
+            <div class="gpw-error">
+                <div class="gpw-error-icon">⚠️</div>
+                <div class="gpw-error-title">Error Loading Posts</div>
+                <div class="gpw-error-message">Please try again or refresh the page.</div>
+                <button class="gpw-error-retry" onclick="location.reload()">Retry</button>
+            </div>
+        `);
+    }
+
+    // Optimized pagination generation
     function updatePagination($wrapper, data) {
-        let settings = $wrapper.data('settings');
-        let paginationType = settings.pagination_type || 'numbers';
-        let $pagination = $wrapper.find('.gpw-pagination');
+        const settings = $wrapper.data('settings');
+        const paginationType = settings.pagination_type || 'numbers';
+        const $pagination = $wrapper.find('.gpw-pagination');
         
         if (data.max_pages <= 1) {
             $pagination.hide();
@@ -134,11 +193,8 @@ function loadPosts($wrapper, paged = 1, append = false) {
                 break;
             case 'load_more':
                 if (data.current_page < data.max_pages) {
-                    paginationHtml = '<button class="gpw-load-more">' + (settings.load_more_text || 'Load More Posts') + '</button>';
+                    paginationHtml = `<button class="gpw-load-more">${settings.load_more_text || 'Load More Posts'}</button>`;
                 }
-                break;
-            case 'infinite':
-                // Infinite scroll is handled separately
                 break;
         }
         
@@ -146,76 +202,68 @@ function loadPosts($wrapper, paged = 1, append = false) {
     }
     
     function generateNumberedPagination(currentPage, maxPages) {
-        let html = '';
+        const prevButton = currentPage > 1 
+            ? `<button class="gpw-page gpw-prev" data-page="${currentPage - 1}">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="25" viewBox="0 0 24 25" fill="none">
+                    <path d="M18 13L6 13M6 13C7 13 9.5 14.5 9.5 16.5M6 13C7 13 9.5 11.5 9.5 9.5" stroke="#7A8487" stroke-width="1.5"/>
+                </svg>
+               </button>` 
+            : '';
+
+        const nextButton = currentPage < maxPages 
+            ? `<button class="gpw-page gpw-next" data-page="${currentPage + 1}">
+                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="8" viewBox="0 0 12 8" fill="none">
+                    <path d="M0 4L12 4M12 4C11 4 8.5 2.5 8.5 0.5M12 4C11 4 8.5 5.5 8.5 7.5" stroke="white" stroke-width="1.5"/>
+                </svg>
+               </button>` 
+            : '';
         
-        // Previous button
-        if (currentPage > 1) {
-            html += '<button class="gpw-page gpw-prev" data-page="' + (currentPage - 1) + '">' +
-            '  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="25" viewBox="0 0 24 25" fill="none">' +
-            '<path d="M18 13L6 13M6 13C7 13 9.5 14.5 9.5 16.5M6 13C7 13 9.5 11.5 9.5 9.5" stroke="#7A8487" stroke-width="1.5"/>' +
-            '</svg>' +
-            '</button>';
-        }
-    
+        // Generate page numbers
+        const startPage = Math.max(1, currentPage - 2);
+        const endPage = Math.min(maxPages, currentPage + 2);
         
-        // Page numbers
-        let startPage = Math.max(1, currentPage - 2);
-        let endPage = Math.min(maxPages, currentPage + 2);
+        let pageNumbers = '';
         
         if (startPage > 1) {
-            html += '<button class="gpw-page" data-page="1">1</button>';
+            pageNumbers += '<button class="gpw-page" data-page="1">1</button>';
             if (startPage > 2) {
-                html += '<span class="gpw-ellipsis">...</span>';
+                pageNumbers += '<span class="gpw-ellipsis">...</span>';
             }
         }
         
         for (let i = startPage; i <= endPage; i++) {
-            let activeClass = i === currentPage ? ' gpw-active' : '';
-            html += '<button class="gpw-page' + activeClass + '" data-page="' + i + '">' + i + '</button>';
+            const activeClass = i === currentPage ? ' gpw-active' : '';
+            pageNumbers += `<button class="gpw-page${activeClass}" data-page="${i}">${i}</button>`;
         }
         
         if (endPage < maxPages) {
             if (endPage < maxPages - 1) {
-                html += '<span class="gpw-ellipsis">...</span>';
+                pageNumbers += '<span class="gpw-ellipsis">...</span>';
             }
-            html += '<button class="gpw-page" data-page="' + maxPages + '">' + maxPages + '</button>';
+            pageNumbers += `<button class="gpw-page" data-page="${maxPages}">${maxPages}</button>`;
         }
         
-        // Next button
-        if (currentPage < maxPages) {
-            html += '<button class="gpw-page gpw-next" data-page="' + (currentPage + 1) + '">' +
-            '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8" viewBox="0 0 12 8" fill="none">' +
-            '<path d="M0 4L12 4M12 4C11 4 8.5 2.5 8.5 0.5M12 4C11 4 8.5 5.5 8.5 7.5" stroke="white" stroke-width="1.5"/>' +
-            '</svg>' +
-            '</button>';
-        }
-        
-        return html;
+        return prevButton + pageNumbers + nextButton;
     }
     
     function generatePrevNextPagination(currentPage, maxPages) {
-        let html = '';
+        const prevButton = currentPage > 1 
+            ? `<button class="gpw-page gpw-prev" data-page="${currentPage - 1}">
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="25" viewBox="0 0 24 25" fill="none">
+                    <path d="M18 13L6 13M6 13C7 13 9.5 14.5 9.5 16.5M6 13C7 13 9.5 11.5 9.5 9.5" stroke="#7A8487" stroke-width="1.5"/>
+                </svg>
+               </button>` 
+            : '';
+
+        const nextButton = currentPage < maxPages 
+            ? `<button class="gpw-page gpw-next" data-page="${currentPage + 1}">
+                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="8" viewBox="0 0 12 8" fill="none">
+                    <path d="M0 4L12 4M12 4C11 4 8.5 2.5 8.5 0.5M12 4C11 4 8.5 5.5 8.5 7.5" stroke="white" stroke-width="1.5"/>
+                </svg>
+               </button>` 
+            : '';
         
-        if (currentPage > 1) {
-            html += '<button class="gpw-page gpw-prev" data-page="' + (currentPage - 1) + '">' +
-            '  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="25" viewBox="0 0 24 25" fill="none">' +
-            '<path d="M18 13L6 13M6 13C7 13 9.5 14.5 9.5 16.5M6 13C7 13 9.5 11.5 9.5 9.5" stroke="#7A8487" stroke-width="1.5"/>' +
-            '</svg>' +
-            '</button>';
-        }
-        
-        html += '<span class="gpw-page-info">Page ' + currentPage + ' of ' + maxPages + '</span>';
-        
-        if (currentPage < maxPages) {
-            html += '<button class="gpw-page gpw-next" data-page="' + (currentPage + 1) + '">' +
-            '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="8" viewBox="0 0 12 8" fill="none">' +
-            '<path d="M0 4L12 4M12 4C11 4 8.5 2.5 8.5 0.5M12 4C11 4 8.5 5.5 8.5 7.5" stroke="white" stroke-width="1.5"/>' +
-            '</svg>' +
-            '</button>';
-        }
-        
-        
-        return html;
+        return prevButton + `<span class="gpw-page-info">Page ${currentPage} of ${maxPages}</span>` + nextButton;
     }
     
     function updateResultsCount($wrapper, foundPosts) {
@@ -225,23 +273,18 @@ function loadPosts($wrapper, paged = 1, append = false) {
             $wrapper.find('.gpw-posts-grid').before($resultsCount);
         }
         
-        if (foundPosts > 0) {
-            $resultsCount.html('Found ' + foundPosts + ' post' + (foundPosts !== 1 ? 's' : ''));
-        } else {
-            $resultsCount.html('');
-        }
+        $resultsCount.html(foundPosts > 0 ? `Found ${foundPosts} post${foundPosts !== 1 ? 's' : ''}` : '');
     }
     
+    // Optimized infinite scroll setup
     function setupInfiniteScroll($wrapper) {
-        let settings = $wrapper.data('settings');
+        const settings = $wrapper.data('settings');
         
         if (settings.show_pagination === 'yes' && settings.pagination_type === 'infinite') {
-            // Remove existing observer
             if (infiniteScrollObserver) {
                 infiniteScrollObserver.disconnect();
             }
             
-            // Create new observer
             infiniteScrollObserver = new IntersectionObserver(function(entries) {
                 entries.forEach(function(entry) {
                     if (entry.isIntersecting && currentPage < maxPages && !loading) {
@@ -252,73 +295,16 @@ function loadPosts($wrapper, paged = 1, append = false) {
                 rootMargin: '100px'
             });
             
-            // Observe the last post
-            let $lastPost = $wrapper.find('.gpw-post').last();
+            const $lastPost = $wrapper.find('.gpw-post').last();
             if ($lastPost.length > 0) {
                 infiniteScrollObserver.observe($lastPost[0]);
             }
         }
     }
     
-    // Cleanup function for observers
-    function cleanupObservers($wrapper) {
-        const observer = $wrapper.data('mutationObserver');
-        if (observer) {
-            observer.disconnect();
-            $wrapper.removeData('mutationObserver');
-        }
-        
-        if (infiniteScrollObserver) {
-            infiniteScrollObserver.disconnect();
-            infiniteScrollObserver = null;
-        }
-    }
-    
-    // Setup accordion toggle functionality
-    function setupAccordionToggle($wrapper) {
-        $wrapper.on('click', '.gpw-accordion-header', function() {
-            const $header = $(this);
-            const $content = $header.next('.gpw-accordion-content');
-            const $toggle = $header.find('.gpw-accordion-toggle');
-            
-            if ($content.is(':visible')) {
-                $content.slideUp(300);
-                $toggle.css({ transform: 'rotate(0deg)', transition: 'transform 0.3s' });
-            } else {
-                $content.slideDown(300);
-                $toggle.css({ transform: 'rotate(180deg)', transition: 'transform 0.3s' });
-            }
-        });
-    }
-    
-    // Setup filter sidebar toggle functionality
-    function setupFilterSidebarToggle($wrapper) {
-        // Hide filters button (inside sidebar)
-        $wrapper.on('click', '.gpw-filter-toggle-btn', function() {
-            const $sidebar = $wrapper.find('.gpw-filters-wrapper');
-            const $showFiltersWrapper = $wrapper.find('.gpw-show-filters-wrapper');
-            
-            // Hide sidebar
-            $sidebar.removeClass('active');
-            // Show the "Show Filters" button
-            $showFiltersWrapper.fadeIn(300);
-        });
-        
-        // Show filters button (outside sidebar)
-        $wrapper.on('click', '.gpw-show-filters-btn', function() {
-            const $sidebar = $wrapper.find('.gpw-filters-wrapper');
-            const $showFiltersWrapper = $wrapper.find('.gpw-show-filters-wrapper');
-            
-            // Show sidebar
-            $sidebar.addClass('active');
-            // Hide the "Show Filters" button
-            $showFiltersWrapper.fadeOut(300);
-        });
-    }
-    
-    // Collect pending filters from DOM
+    // Optimized filter collection
     function collectPendingFilters($wrapper) {
-        let filters = {
+        const filters = {
             acf: {},
             tax: {},
             dateFrom: '',
@@ -327,10 +313,10 @@ function loadPosts($wrapper, paged = 1, append = false) {
         
         // Collect ACF filters
         $wrapper.find('.gpw-acf-filter').each(function() {
-            let $field = $(this);
-            let fieldName = $field.data('field');
-            let fieldType = $field.attr('type') || ($field.is('select') ? 'select' : 'text');
-            let value = $field.val();
+            const $field = $(this);
+            const fieldName = $field.data('field');
+            const fieldType = $field.attr('type') || ($field.is('select') ? 'select' : 'text');
+            const value = $field.val();
             
             if (fieldType === 'checkbox') {
                 if ($field.is(':checked')) {
@@ -348,32 +334,29 @@ function loadPosts($wrapper, paged = 1, append = false) {
                     filters.acf[fieldName] = value;
                 }
             } else {
-                // Text, date, etc.
                 if (value && value.trim() !== '') {
                     filters.acf[fieldName] = value;
                 }
             }
         });
         
-        // Collect taxonomy filters - FIXED VERSION
+        // Collect taxonomy filters
         $wrapper.find('.gpw-tax-filter').each(function() {
-            let $field = $(this);
-            let taxonomy = $field.data('taxonomy');
-            let fieldType = $field.attr('type') || 'select';
-            let value = $field.val();
+            const $field = $(this);
+            const taxonomy = $field.data('taxonomy');
+            const fieldType = $field.attr('type') || 'select';
+            const value = $field.val();
             
             if (fieldType === 'checkbox') {
                 if ($field.is(':checked')) {
                     if (!filters.tax[taxonomy]) {
                         filters.tax[taxonomy] = [];
                     }
-                    // Only add if not already in array
                     if (filters.tax[taxonomy].indexOf(value) === -1) {
                         filters.tax[taxonomy].push(value);
                     }
                 }
             } else {
-                // Select, radio, etc.
                 if (value && value !== '' && value !== 'all') {
                     if (!filters.tax[taxonomy]) {
                         filters.tax[taxonomy] = [];
@@ -382,79 +365,68 @@ function loadPosts($wrapper, paged = 1, append = false) {
                 }
             }
         });
-    
         
-        // Collect date filters
         filters.dateFrom = $wrapper.find('.gpw-date-filter-from').val();
         filters.dateTo = $wrapper.find('.gpw-date-filter-to').val();
         
         return filters;
     }
     
-    // Update accordion count numbers
+    // Optimized accordion count update
     function updateAccordionCounts($wrapper) {
-        // Find all count elements
-        let $countElements = $wrapper.find('.gpw-accordion-count[data-field]');
-        
-        // Update ACF field counts - show total available options
-        $countElements.each(function() {
-            let fieldName = $(this).data('field');
-            let $countElement = $(this);
+        $wrapper.find('.gpw-accordion-count[data-field]').each(function() {
+            const fieldName = $(this).data('field');
+            const $countElement = $(this);
             
-            // Count total available options for this field
-            let $acfFilters = $wrapper.find('.gpw-acf-filter[data-field="' + fieldName + '"]');
-            let totalOptions = $acfFilters.length;
+            let totalOptions = $wrapper.find(`.gpw-acf-filter[data-field="${fieldName}"]`).length;
             
             if (totalOptions === 0) {
-                // If no ACF filters found, try taxonomy filters
-                let $taxFilters = $wrapper.find('.gpw-tax-filter[data-taxonomy="' + fieldName + '"]');
-                totalOptions = $taxFilters.length;
+                totalOptions = $wrapper.find(`.gpw-tax-filter[data-taxonomy="${fieldName}"]`).length;
             }
             
             $countElement.text(totalOptions);
         });
     }
     
-    // Update selected filters display
+    // Optimized selected filters display
     function updateSelectedFiltersDisplay($wrapper) {
-        let filters = collectPendingFilters($wrapper);
-        let $selectedFilters = $wrapper.find('.gpw-selected-filters');
-        let $selectedTags = $wrapper.find('.gpw-selected-filters-tags');
-        let $selectedCount = $wrapper.find('.gpw-selected-count');
-        let $filterActions = $wrapper.find('.gpw-filter-actions');
-        let $filtersIndicator = $wrapper.find('.gpw-filters-indicator');
+        const filters = collectPendingFilters($wrapper);
+        const $selectedFilters = $wrapper.find('.gpw-selected-filters');
+        const $selectedTags = $wrapper.find('.gpw-selected-filters-tags');
+        const $selectedCount = $wrapper.find('.gpw-selected-count');
+        const $filterActions = $wrapper.find('.gpw-filter-actions');
+        const $filtersIndicator = $wrapper.find('.gpw-filters-indicator');
         
-        let selectedItems = [];
+        const selectedItems = [];
         let totalCount = 0;
         
-        // Count ACF filters
-        Object.keys(filters.acf).forEach(fieldName => {
-            if (Array.isArray(filters.acf[fieldName])) {
-                filters.acf[fieldName].forEach(value => {
+        // Process ACF filters
+        Object.entries(filters.acf).forEach(([fieldName, value]) => {
+            if (Array.isArray(value)) {
+                value.forEach(v => {
                     selectedItems.push({
                         type: 'acf',
                         field: fieldName,
-                        value: value,
-                        label: value
+                        value: v,
+                        label: v
                     });
                     totalCount++;
                 });
-            } else if (filters.acf[fieldName]) {
+            } else if (value) {
                 selectedItems.push({
                     type: 'acf',
                     field: fieldName,
-                    value: filters.acf[fieldName],
-                    label: filters.acf[fieldName]
+                    value: value,
+                    label: value
                 });
                 totalCount++;
             }
         });
         
-        // Count taxonomy filters - FIXED: Handle array of terms
-        Object.keys(filters.tax).forEach(taxonomy => {
-            if (Array.isArray(filters.tax[taxonomy])) {
-                // Multiple terms selected for this taxonomy
-                filters.tax[taxonomy].forEach(term => {
+        // Process taxonomy filters
+        Object.entries(filters.tax).forEach(([taxonomy, terms]) => {
+            if (Array.isArray(terms)) {
+                terms.forEach(term => {
                     selectedItems.push({
                         type: 'tax',
                         taxonomy: taxonomy,
@@ -463,27 +435,26 @@ function loadPosts($wrapper, paged = 1, append = false) {
                     });
                     totalCount++;
                 });
-            } else if (filters.tax[taxonomy]) {
-                // Single term selected for this taxonomy
+            } else if (terms) {
                 selectedItems.push({
                     type: 'tax',
                     taxonomy: taxonomy,
-                    value: filters.tax[taxonomy],
-                    label: filters.tax[taxonomy]
+                    value: terms,
+                    label: terms
                 });
                 totalCount++;
             }
         });
         
-        // Count date filters
+        // Process date filters
         if (filters.dateFrom || filters.dateTo) {
             let dateLabel = '';
             if (filters.dateFrom && filters.dateTo) {
-                dateLabel = filters.dateFrom + ' - ' + filters.dateTo;
+                dateLabel = `${filters.dateFrom} - ${filters.dateTo}`;
             } else if (filters.dateFrom) {
-                dateLabel = 'From ' + filters.dateFrom;
+                dateLabel = `From ${filters.dateFrom}`;
             } else if (filters.dateTo) {
-                dateLabel = 'To ' + filters.dateTo;
+                dateLabel = `To ${filters.dateTo}`;
             }
             
             selectedItems.push({
@@ -495,109 +466,79 @@ function loadPosts($wrapper, paged = 1, append = false) {
             totalCount++;
         }
         
-        // Update count
         $selectedCount.text(totalCount);
         
         // Generate tags HTML
-        let tagsHtml = '';
-        selectedItems.forEach(item => {
-            tagsHtml += '<span class="gpw-selected-tag" data-type="' + item.type + '"';
-            if (item.field) tagsHtml += ' data-field="' + item.field + '"';
-            if (item.taxonomy) tagsHtml += ' data-taxonomy="' + item.taxonomy + '"';
-            if (item.value) tagsHtml += ' data-value="' + item.value + '"';
-            tagsHtml += '>';
-            tagsHtml += 
-            '<span class="gpw-tag">' + 
-                '<span class="gpw-remove-tag">' +
-                '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10" fill="none">' +
-                    '<path d="M8.375 8.375L1.625 1.625M1.625 8.375L8.375 1.625" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>' +
-                '</svg>' +
-                '</span> ' + 
-                item.label + 
-            '</span>';
-            tagsHtml += '</span>';
-        });
-
+        const tagsHtml = selectedItems.map(item => {
+            const dataAttrs = [
+                `data-type="${item.type}"`,
+                item.field ? `data-field="${item.field}"` : '',
+                item.taxonomy ? `data-taxonomy="${item.taxonomy}"` : '',
+                item.value ? `data-value="${item.value}"` : ''
+            ].filter(Boolean).join(' ');
+            
+            return `<span class="gpw-selected-tag" ${dataAttrs}>
+                <span class="gpw-tag">
+                    <span class="gpw-remove-tag">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10" fill="none">
+                            <path d="M8.375 8.375L1.625 1.625M1.625 8.375L8.375 1.625" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </span> ${item.label}
+                </span>
+            </span>`;
+        }).join('');
         
         $selectedTags.html(tagsHtml);
         
-        // Show/hide selected filters section
-        if (totalCount > 0) {
-            $selectedFilters.show();
-        } else {
-            $selectedFilters.hide();
-        }
+        // Show/hide elements based on filter count
+        $selectedFilters.toggle(totalCount > 0);
+        $filterActions.toggle(totalCount > 0);
         
-        // Show/hide filter action buttons based on whether there are pending filters
-        if (totalCount > 0) {
-            $filterActions.fadeIn(300);
-
-        } else {
-            $filterActions.fadeOut(300);
-
-        }
-        
-        // Update accordion count numbers
         updateAccordionCounts($wrapper);
     }
     
     function isEmptyFilters(filters) {
         return Object.keys(filters.acf).length === 0 &&
                Object.keys(filters.tax).length === 0 &&
-               (filters.dateFrom || '') === '' &&
-               (filters.dateTo || '') === '';
+               !filters.dateFrom &&
+               !filters.dateTo;
     }
     
-    // Remove selected filter tag
+    // Optimized filter removal
     function removeSelectedFilter($wrapper, $tag) {
-        let type = $tag.data('type');
-        let field = $tag.data('field');
-        let taxonomy = $tag.data('taxonomy');
-        let value = $tag.data('value');
+        const type = $tag.data('type');
+        const field = $tag.data('field');
+        const taxonomy = $tag.data('taxonomy');
+        const value = $tag.data('value');
         
         if (type === 'acf' && field) {
-            let $fields = $wrapper.find('.gpw-acf-filter[data-field="' + field + '"]');
+            const $fields = $wrapper.find(`.gpw-acf-filter[data-field="${field}"]`);
             if ($fields.length > 0) {
-                let fieldType = $fields.first().attr('type') || ($fields.first().is('select') ? 'select' : 'text');
+                const fieldType = $fields.first().attr('type') || ($fields.first().is('select') ? 'select' : 'text');
                 if (fieldType === 'checkbox' || fieldType === 'radio') {
-                    $fields.each(function() {
-                        let $field = $(this);
-                        if ($field.val() === value) {
-                            $field.prop('checked', false).trigger('change');
-                        }
-                    });
-                } else if (fieldType === 'select') {
-                    $fields.val('').trigger('change');
+                    $fields.filter(`[value="${value}"]`).prop('checked', false).trigger('change');
                 } else {
                     $fields.val('').trigger('change');
                 }
             }
         } else if (type === 'tax' && taxonomy) {
-            let $fields = $wrapper.find('.gpw-tax-filter[data-taxonomy="' + taxonomy + '"]');
+            const $fields = $wrapper.find(`.gpw-tax-filter[data-taxonomy="${taxonomy}"]`);
             if ($fields.length > 0) {
-                let fieldType = $fields.first().attr('type') || ($fields.first().is('select') ? 'select' : 'text');
+                const fieldType = $fields.first().attr('type') || ($fields.first().is('select') ? 'select' : 'text');
                 if (fieldType === 'checkbox' || fieldType === 'radio') {
-                    $fields.each(function() {
-                        let $field = $(this);
-                        if ($field.val() === value) {
-                            $field.prop('checked', false).trigger('change');
-                        }
-                    });
-                } else if (fieldType === 'select') {
-                    $fields.val('').trigger('change');
+                    $fields.filter(`[value="${value}"]`).prop('checked', false).trigger('change');
                 } else {
                     $fields.val('').trigger('change');
                 }
             }
         } else if (type === 'date') {
-            $wrapper.find('.gpw-date-filter-from').val('').trigger('change');
-            $wrapper.find('.gpw-date-filter-to').val('').trigger('change');
+            $wrapper.find('.gpw-date-filter-from, .gpw-date-filter-to').val('').trigger('change');
         }
         
         updateSelectedFiltersDisplay($wrapper);
     }
     
-    // Apply filters
+    // Optimized filter application
     function applyFilters($wrapper) {
         pendingFilters = collectPendingFilters($wrapper);
         appliedFilters = JSON.parse(JSON.stringify(pendingFilters));
@@ -609,151 +550,79 @@ function loadPosts($wrapper, paged = 1, append = false) {
         $sidebar.removeClass('active');
         $showFiltersWrapper.fadeIn(300);
 
-        // ✅ Show indicator only when filters are applied
-        if (Object.keys(appliedFilters.acf).length > 0 || 
-            Object.keys(appliedFilters.tax).length > 0 || 
-            appliedFilters.dateFrom || 
-            appliedFilters.dateTo || 
-            appliedFilters.search) {
-            $filtersIndicator.fadeIn(300);
-        } else {
-            $filtersIndicator.fadeOut(300);
-        }
-
+        // Show indicator when filters are applied
+        const hasFilters = Object.keys(appliedFilters.acf).length > 0 || 
+                          Object.keys(appliedFilters.tax).length > 0 || 
+                          appliedFilters.dateFrom || 
+                          appliedFilters.dateTo || 
+                          appliedFilters.search;
+        
+        $filtersIndicator.toggle(hasFilters);
         loadPosts($wrapper, 1);
     }
 
-    
-    // Reset all filters
+    // Optimized filter reset
     function resetFilters($wrapper) {
-        // Uncheck all checkboxes
-        $wrapper.find('.gpw-acf-filter[type="checkbox"]').prop('checked', false);
-        $wrapper.find('.gpw-tax-filter[type="checkbox"]').prop('checked', false);
-        
-        // Uncheck radio buttons
-        $wrapper.find('.gpw-acf-filter[type="radio"]').prop('checked', false);
-        
-        // Clear text inputs
-        $wrapper.find('.gpw-acf-filter[type="text"]').val('');
-        $wrapper.find('.gpw-acf-filter[type="date"]').val('');
-        
-        // Clear date inputs
-        $wrapper.find('.gpw-date-filter-from').val('');
-        $wrapper.find('.gpw-date-filter-to').val('');
-        
-        // Clear selects
-        $wrapper.find('.gpw-acf-filter[type="select"]').prop('selectedIndex', 0);
+        // Clear all form elements
+        $wrapper.find('.gpw-acf-filter, .gpw-tax-filter, .gpw-date-filter-from, .gpw-date-filter-to')
+                .val('')
+                .prop('checked', false)
+                .prop('selectedIndex', 0);
         
         // Clear applied filters
         appliedFilters = {};
         pendingFilters = {};
         
-        // Close the filters sidebar
+        // Close sidebar and hide indicator
         const $sidebar = $wrapper.find('.gpw-filters-wrapper');
         const $showFiltersWrapper = $wrapper.find('.gpw-show-filters-wrapper');
+        const $filtersIndicator = $wrapper.find('.gpw-filters-indicator');
         
         $sidebar.removeClass('active');
         $showFiltersWrapper.fadeIn(300);
-        const $filtersIndicator = $wrapper.find('.gpw-filters-indicator');
-        $filtersIndicator.fadeOut(300); // ✅ Always hid
-        // Update display
-        updateSelectedFiltersDisplay($wrapper);
+        $filtersIndicator.fadeOut(300);
         
-        // Reload posts
+        updateSelectedFiltersDisplay($wrapper);
         loadPosts($wrapper, 1);
     }
     
-        // Generate skeleton loading cards
-    function generateSkeletonCards(count, settings) {
-        let gridColumns = settings.grid_columns || 3;
-        let gridColumnsTablet = settings.grid_columns_tablet || 2;
-        let gridColumnsMobile = settings.grid_columns_mobile || 1;
-        
-        // Check if skeleton is enabled
-        if (settings.show_skeleton !== 'yes') {
-            return '';
-        }
-        
-        let skeletonHtml = '';
-        for (let i = 0; i < count; i++) {
-            let layoutClass = settings.skeleton_layout || 'image-top';
+    // Optimized accordion setup
+    function setupAccordionToggle($wrapper) {
+        $wrapper.on('click', '.gpw-accordion-header', function() {
+            const $header = $(this);
+            const $content = $header.next('.gpw-accordion-content');
+            const $toggle = $header.find('.gpw-accordion-toggle');
             
-            skeletonHtml += `
-                <div class="gpw-skeleton-card gpw-skeleton-${layoutClass}">
-                    ${generateSkeletonImage(settings)}
-                    <div class="gpw-skeleton-content">
-                        ${generateSkeletonContent(settings)}
-                    </div>
-                </div>
-            `;
-        }
-        
-        return skeletonHtml;
-    }
-    
-    // Generate skeleton image based on layout
-    function generateSkeletonImage(settings) {
-        if (settings.skeleton_image !== 'yes') {
-            return '';
-        }
-        
-        return '<div class="gpw-skeleton-image"></div>';
-    }
-    
-    // Generate skeleton content based on user order
-    function generateSkeletonContent(settings) {
-        let content = '';
-        
-        // Use custom content order if set, otherwise use default
-        let contentOrder = settings.skeleton_content_order && settings.skeleton_content_order.length > 0 
-            ? settings.skeleton_content_order 
-            : [
-                {element: 'title'},
-                {element: 'excerpt'},
-                {element: 'meta'}
-            ];
-        
-        contentOrder.forEach(item => {
-            switch(item.element) {
-                case 'title':
-                    if (settings.skeleton_title === 'yes') {
-                        content += '<div class="gpw-skeleton-title"></div>';
-                    }
-                    break;
-                case 'excerpt':
-                    if (settings.skeleton_excerpt === 'yes') {
-                        content += `
-                            <div class="gpw-skeleton-excerpt">
-                                ${generateSkeletonLines(settings.skeleton_lines || 3)}
-                            </div>
-                        `;
-                    }
-                    break;
-                case 'meta':
-                    if (settings.skeleton_meta === 'yes') {
-                        content += `
-                            <div class="gpw-skeleton-meta">
-                                <div class="gpw-skeleton-date"></div>
-                                <div class="gpw-skeleton-category"></div>
-                            </div>
-                        `;
-                    }
-                    break;
+            if ($content.is(':visible')) {
+                $content.slideUp(300);
+                $toggle.css({ transform: 'rotate(0deg)', transition: 'transform 0.3s' });
+            } else {
+                $content.slideDown(300);
+                $toggle.css({ transform: 'rotate(180deg)', transition: 'transform 0.3s' });
             }
         });
+    }
+    
+    // Optimized sidebar toggle
+    function setupFilterSidebarToggle($wrapper) {
+        $wrapper.on('click', '.gpw-filter-toggle-btn', function() {
+            const $sidebar = $wrapper.find('.gpw-filters-wrapper');
+            const $showFiltersWrapper = $wrapper.find('.gpw-show-filters-wrapper');
+            
+            $sidebar.removeClass('active');
+            $showFiltersWrapper.fadeIn(300);
+        });
         
-        return content;
+        $wrapper.on('click', '.gpw-show-filters-btn', function() {
+            const $sidebar = $wrapper.find('.gpw-filters-wrapper');
+            const $showFiltersWrapper = $wrapper.find('.gpw-show-filters-wrapper');
+            
+            $sidebar.addClass('active');
+            $showFiltersWrapper.fadeOut(300);
+        });
     }
     
-    // Generate skeleton lines based on user setting
-    function generateSkeletonLines(count) {
-        let lines = '';
-        for (let i = 0; i < count; i++) {
-            lines += '<div class="gpw-skeleton-line"></div>';
-        }
-        return lines;
-    }
-    
+    // Optimized debounce function
     function debounce(func, wait) {
         let timeout;
         return function executedFunction(...args) {
@@ -766,10 +635,24 @@ function loadPosts($wrapper, paged = 1, append = false) {
         };
     }
     
-    // Initialize widgets
+    // Cleanup function
+    function cleanupObservers($wrapper) {
+        const observer = $wrapper.data('mutationObserver');
+        if (observer) {
+            observer.disconnect();
+            $wrapper.removeData('mutationObserver');
+        }
+        
+        if (infiniteScrollObserver) {
+            infiniteScrollObserver.disconnect();
+            infiniteScrollObserver = null;
+        }
+    }
+    
+    // Initialize widgets with optimized event handling
     $('.gpw-wrapper').each(function() {
-        let $wrapper = $(this);
-        let settings = $wrapper.data('settings');
+        const $wrapper = $(this);
+        const settings = $wrapper.data('settings');
         
         // Initialize filters
         pendingFilters = {};
@@ -778,83 +661,68 @@ function loadPosts($wrapper, paged = 1, append = false) {
         // Initial load
         loadPosts($wrapper, 1);
         
-        // Initially hide filter action buttons and filters indicator
-        $wrapper.find('.gpw-filter-actions').hide();
-        $wrapper.find('.gpw-filters-indicator').hide();
+        // Hide elements initially
+        $wrapper.find('.gpw-filter-actions, .gpw-filters-indicator').hide();
         
-        // Initialize accordion counts
         updateAccordionCounts($wrapper);
         
-        // Search handler with debounce
+        // Optimized search handler
         if (settings.show_search === 'yes') {
-            let debouncedSearch = debounce(function() {
-                // Update search term in applied filters
-                let searchTerm = $wrapper.find('.gpw-search').val();
+            const debouncedSearch = debounce(function() {
+                const searchTerm = $wrapper.find('.gpw-search').val();
                 appliedFilters.search = searchTerm;
                 loadPosts($wrapper, 1);
-            }, 500);
+            }, 300); // Reduced debounce time for better responsiveness
             
             $wrapper.on('keyup', '.gpw-search', debouncedSearch);
             
-            // Add input event for immediate feedback
             $wrapper.on('input', '.gpw-search', function() {
-                let searchTerm = $(this).val();
-                let $clearBtn = $wrapper.find('.gpw-search-clear');
-                
-                // Show/hide clear button
-                if (searchTerm.length > 0) {
-                    $clearBtn.fadeIn(200);
-                } else {
-                    $clearBtn.fadeOut(200);
-                }
+                const searchTerm = $(this).val();
+                const $clearBtn = $wrapper.find('.gpw-search-clear');
+                $clearBtn.toggle(searchTerm.length > 0);
             });
             
-            // Clear search button
             $wrapper.on('click', '.gpw-search-clear', function() {
                 $wrapper.find('.gpw-search').val('');
                 appliedFilters.search = '';
                 loadPosts($wrapper, 1);
-                $(this).fadeOut(200);
+                $(this).hide();
             });
         }
         
-        // Filter change handlers - update pending filters display and auto-apply if empty
+        // Filter change handlers
         $wrapper.on('change', '.gpw-acf-filter, .gpw-tax-filter, .gpw-date-filter-from, .gpw-date-filter-to', function() {
             updateSelectedFiltersDisplay($wrapper);
-            let pending = collectPendingFilters($wrapper);
+            const pending = collectPendingFilters($wrapper);
             if (isEmptyFilters(pending)) {
                 applyFilters($wrapper);
             }
         });
         
-        // Remove selected filter tag
+        // Event delegation for better performance
         $wrapper.on('click', '.gpw-remove-tag', function(e) {
             e.preventDefault();
             removeSelectedFilter($wrapper, $(this).closest('.gpw-selected-tag'));
         });
         
-        // Confirm filters button
         $wrapper.on('click', '.gpw-confirm-filters', function(e) {
             e.preventDefault();
             applyFilters($wrapper);
         });
         
-        // Reset filters button
         $wrapper.on('click', '.gpw-reset-filters', function(e) {
             e.preventDefault();
             resetFilters($wrapper);
         });
         
-        // Pagination handlers
         $wrapper.on('click', '.gpw-page', function(e) {
             e.preventDefault();
-            let page = $(this).data('page');
+            const page = $(this).data('page');
             if (page && page !== currentPage) {
                 loadPosts($wrapper, page);
             }
         });
         
-        // Load more handler
         $wrapper.on('click', '.gpw-load-more', function(e) {
             e.preventDefault();
             if (currentPage < maxPages && !loading) {
@@ -862,52 +730,19 @@ function loadPosts($wrapper, paged = 1, append = false) {
             }
         });
         
-        // Setup infinite scroll if enabled
+        // Setup features
         if (settings.show_pagination === 'yes' && settings.pagination_type === 'infinite') {
             setupInfiniteScroll($wrapper);
         }
         
-        // Setup accordion toggle if using accordion layout
         if (settings.filters_layout === 'accordion') {
             setupAccordionToggle($wrapper);
         }
         
-        // Setup filter sidebar toggle
         setupFilterSidebarToggle($wrapper);
     });
     
-    // Setup mutation observer for each wrapper
-    function setupMutationObserver($wrapper) {
-        if (!window.MutationObserver) return;
-        
-        const observer = new MutationObserver(function(mutations) {
-            mutations.forEach(function(mutation) {
-                if (mutation.type === 'childList') {
-                    mutation.addedNodes.forEach(function(node) {
-                        if (node.nodeType === 1 && node.classList.contains('gpw-post')) {
-                            setupInfiniteScroll($wrapper);
-                        }
-                    });
-                }
-            });
-        });
-        
-        observer.observe($wrapper[0], {
-            childList: true,
-            subtree: true
-        });
-        
-        // Store observer reference for cleanup
-        $wrapper.data('mutationObserver', observer);
-    }
-    
-    // Setup mutation observer for each wrapper
-    $('.gpw-wrapper').each(function() {
-        let $wrapper = $(this);
-        setupMutationObserver($wrapper);
-    });
-    
-    // Cleanup observers on page unload
+    // Cleanup on page unload
     $(window).on('beforeunload', function() {
         $('.gpw-wrapper').each(function() {
             cleanupObservers($(this));
@@ -915,165 +750,183 @@ function loadPosts($wrapper, paged = 1, append = false) {
     });
 });
 
-
+// Optimized Dark/Light Mode Toggle
 document.addEventListener("DOMContentLoaded", () => {
-    const darkRGB = "rgb(0, 19, 25)";   // your real dark color #001319
-    const whiteRGB = "rgb(255, 255, 255)";
-
+    const DARK_COLOR = "#001319";
+    const WHITE_COLOR = "#ffffff";
+    const THEME_KEY = "gpw_theme";
+    
     const lightBtn = document.getElementById("lightToggle");
     const darkBtn = document.getElementById("darkToggle");
-
-    function setLightMode() {
-        const allElements = document.querySelectorAll(
-            "*:not(footer):not(footer *):not(.no-theme-switch):not(.no-theme-switch *)"
-        );
-
-        allElements.forEach(el => {
-            const style = getComputedStyle(el);
-            let changed = false;
-
-            // Background swap
-            if (style.backgroundColor === darkRGB) {
-                el.style.backgroundColor = whiteRGB;
-                el.dataset.prevBg = darkRGB;
-                changed = true;
-            } else if (style.backgroundColor === whiteRGB) {
-                el.style.backgroundColor = darkRGB;
-                el.dataset.prevBg = whiteRGB;
-                changed = true;
-            }
-
-            // Text color swap
-            if (style.color === darkRGB) {
-                el.style.color = whiteRGB;
-                el.dataset.prevColor = darkRGB;
-                changed = true;
-            } else if (style.color === whiteRGB) {
-                el.style.color = darkRGB;
-                el.dataset.prevColor = whiteRGB;
-                changed = true;
-            }
-
-            // Border color swap
-            ["Top", "Right", "Bottom", "Left"].forEach(side => {
-                const key = "border" + side + "Color";
-                if (style[key] === darkRGB) {
-                    el.style[key] = whiteRGB;
-                    el.dataset["prevBorder" + side] = darkRGB;
+    
+    // Cache DOM elements that need theme switching
+    let themeElements = null;
+    
+    function cacheThemeElements() {
+        if (!themeElements) {
+            themeElements = document.querySelectorAll(
+                "*:not(footer):not(footer *):not(.no-theme-switch):not(.no-theme-switch *)"
+            );
+        }
+        return themeElements;
+    }
+    
+    // Optimized color conversion
+    function rgbToHex(rgb) {
+        if (rgb === `rgb(0, 19, 25)`) return DARK_COLOR;
+        if (rgb === `rgb(255, 255, 255)`) return WHITE_COLOR;
+        return rgb;
+    }
+    
+    function shouldSwapColor(color, isDarkMode) {
+        const hex = rgbToHex(color);
+        return (isDarkMode && hex === WHITE_COLOR) || (!isDarkMode && hex === DARK_COLOR);
+    }
+    
+    // Optimized theme application
+    function applyTheme(isDarkMode) {
+        const elements = cacheThemeElements();
+        const fromColor = isDarkMode ? WHITE_COLOR : DARK_COLOR;
+        const toColor = isDarkMode ? DARK_COLOR : WHITE_COLOR;
+        
+        // Use requestAnimationFrame for better performance
+        requestAnimationFrame(() => {
+            elements.forEach(el => {
+                const style = getComputedStyle(el);
+                let changed = false;
+                
+                // Background color
+                if (rgbToHex(style.backgroundColor) === fromColor) {
+                    el.style.backgroundColor = toColor;
+                    el.dataset.prevBg = fromColor;
                     changed = true;
-                } else if (style[key] === whiteRGB) {
-                    el.style[key] = darkRGB;
-                    el.dataset["prevBorder" + side] = whiteRGB;
+                }
+                
+                // Text color
+                if (rgbToHex(style.color) === fromColor) {
+                    el.style.color = toColor;
+                    el.dataset.prevColor = fromColor;
                     changed = true;
+                }
+                
+                // Border colors
+                ["Top", "Right", "Bottom", "Left"].forEach(side => {
+                    const borderColor = style[`border${side}Color`];
+                    if (rgbToHex(borderColor) === fromColor) {
+                        el.style[`border${side}Color`] = toColor;
+                        el.dataset[`prevBorder${side}`] = fromColor;
+                        changed = true;
+                    }
+                });
+                
+                // SVG elements
+                if (["svg", "path", "circle", "rect", "g"].includes(el.tagName.toLowerCase())) {
+                    if (rgbToHex(style.fill) === fromColor) {
+                        el.style.fill = toColor;
+                        el.dataset.prevFill = fromColor;
+                        changed = true;
+                    }
+                    
+                    if (rgbToHex(style.stroke) === fromColor) {
+                        el.style.stroke = toColor;
+                        el.dataset.prevStroke = fromColor;
+                        changed = true;
+                    }
+                }
+                
+                if (changed) {
+                    el.dataset.themeModified = isDarkMode ? "dark" : "light";
                 }
             });
-
-            // SVG stroke/fill swap
-            const tagName = el.tagName.toLowerCase();
-            if (["svg", "path", "circle", "rect", "g"].includes(tagName)) {
-                if (style.fill === darkRGB) {
-                    el.style.fill = whiteRGB;
-                    el.dataset.prevFill = darkRGB;
-                    changed = true;
-                } else if (style.fill === whiteRGB) {
-                    el.style.fill = darkRGB;
-                    el.dataset.prevFill = whiteRGB;
-                    changed = true;
-                }
-
-                if (style.stroke === darkRGB) {
-                    el.style.stroke = whiteRGB;
-                    el.dataset.prevStroke = darkRGB;
-                    changed = true;
-                } else if (style.stroke === whiteRGB) {
-                    el.style.stroke = darkRGB;
-                    el.dataset.prevStroke = whiteRGB;
-                    changed = true;
-                }
-            }
-
-            if (changed) {
-                el.dataset.lightMode = "true";
-            }
         });
     }
-
-    function setDarkMode() {
-        const modifiedElements = document.querySelectorAll("[data-light-mode='true']");
-        modifiedElements.forEach(el => {
-            if (el.dataset.prevBg) {
-                el.style.backgroundColor = el.dataset.prevBg;
-                delete el.dataset.prevBg;
-            }
-            if (el.dataset.prevColor) {
-                el.style.color = el.dataset.prevColor;
-                delete el.dataset.prevColor;
-            }
-            ["Top", "Right", "Bottom", "Left"].forEach(side => {
-                const key = "prevBorder" + side;
-                if (el.dataset[key]) {
-                    el.style["border" + side + "Color"] = el.dataset[key];
-                    delete el.dataset[key];
-                }
+    
+    // Optimized theme restoration
+    function restoreTheme() {
+        const modifiedElements = document.querySelectorAll("[data-theme-modified]");
+        
+        requestAnimationFrame(() => {
+            modifiedElements.forEach(el => {
+                // Restore all modified properties
+                ["prevBg", "prevColor", "prevFill", "prevStroke"].forEach(prop => {
+                    if (el.dataset[prop]) {
+                        const styleProp = prop.replace("prev", "").toLowerCase();
+                        const actualProp = styleProp === "bg" ? "backgroundColor" : styleProp;
+                        el.style[actualProp] = el.dataset[prop];
+                        delete el.dataset[prop];
+                    }
+                });
+                
+                // Restore border colors
+                ["Top", "Right", "Bottom", "Left"].forEach(side => {
+                    const key = `prevBorder${side}`;
+                    if (el.dataset[key]) {
+                        el.style[`border${side}Color`] = el.dataset[key];
+                        delete el.dataset[key];
+                    }
+                });
+                
+                delete el.dataset.themeModified;
             });
-            if (el.dataset.prevFill) {
-                el.style.fill = el.dataset.prevFill;
-                delete el.dataset.prevFill;
-            }
-            if (el.dataset.prevStroke) {
-                el.style.stroke = el.dataset.prevStroke;
-                delete el.dataset.prevStroke;
-            }
-            delete el.dataset.lightMode;
         });
     }
-
+    
     function activateLightMode() {
-        if (!lightBtn) return;
-        if (lightBtn.classList.contains("active")) return;
-        document.body.classList.remove("dark-theme");
-        document.body.classList.add("light-theme");
+        if (!lightBtn || lightBtn.classList.contains("active")) return;
+        
+        document.body.className = document.body.className.replace(/\b(dark|light)-theme\b/g, '') + ' light-theme';
+        
         lightBtn.classList.add("active");
         lightBtn.classList.remove("inactive");
+        
         if (darkBtn) {
             darkBtn.classList.remove("active");
             darkBtn.classList.add("inactive");
         }
-        setLightMode();
-
-        // save state
-        localStorage.setItem("theme", "light");
+        
+        applyTheme(false);
+        localStorage.setItem(THEME_KEY, "light");
     }
-
+    
     function activateDarkMode() {
-        if (!darkBtn) return;
-        if (darkBtn.classList.contains("active")) return;
-        document.body.classList.remove("light-theme");
-        document.body.classList.add("dark-theme");
+        if (!darkBtn || darkBtn.classList.contains("active")) return;
+        
+        document.body.className = document.body.className.replace(/\b(dark|light)-theme\b/g, '') + ' dark-theme';
+        
         darkBtn.classList.add("active");
         darkBtn.classList.remove("inactive");
+        
         if (lightBtn) {
             lightBtn.classList.remove("active");
             lightBtn.classList.add("inactive");
         }
-        setDarkMode();
-
-        // save state
-        localStorage.setItem("theme", "dark");
+        
+        restoreTheme();
+        localStorage.setItem(THEME_KEY, "dark");
     }
-
-    // ✅ Restore saved theme on page load
-    const savedTheme = localStorage.getItem("theme");
+    
+    // Initialize theme from localStorage
+    const savedTheme = localStorage.getItem(THEME_KEY);
     if (savedTheme === "light") {
         activateLightMode();
     } else if (savedTheme === "dark") {
         activateDarkMode();
+    } else {
+        // Default to dark mode
+        activateDarkMode();
     }
-
-    // Event binding
+    
+    // Event listeners
     if (lightBtn) lightBtn.addEventListener("click", activateLightMode);
     if (darkBtn) darkBtn.addEventListener("click", activateDarkMode);
+    
+    // Invalidate cache when DOM changes significantly
+    const observer = new MutationObserver(() => {
+        themeElements = null;
+    });
+    
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
 });
-
-
-

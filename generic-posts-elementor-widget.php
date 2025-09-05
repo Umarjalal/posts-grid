@@ -77,17 +77,34 @@ add_action( 'wp_enqueue_scripts', function() {
 add_action('wp_ajax_gpw_filter_posts', 'gpw_filter_posts');
 add_action('wp_ajax_nopriv_gpw_filter_posts', 'gpw_filter_posts');
 
+// Add caching headers for better performance
+add_action('wp_ajax_gpw_filter_posts', 'gpw_add_cache_headers');
+add_action('wp_ajax_nopriv_gpw_filter_posts', 'gpw_add_cache_headers');
+
+function gpw_add_cache_headers() {
+    if (!headers_sent()) {
+        header('Cache-Control: public, max-age=300'); // 5 minutes cache
+        header('Vary: Accept-Encoding');
+    }
+}
 
 function gpw_filter_posts() {
     check_ajax_referer('gpw_nonce', 'nonce');
 
     global $wpdb;
 
+    // Optimize memory usage
+    if (function_exists('wp_suspend_cache_addition')) {
+        wp_suspend_cache_addition(true);
+    }
+
     $post_type        = sanitize_text_field($_POST['post_type'] ?? 'post');
     $posts_per_page   = intval($_POST['posts_per_page'] ?? 6);
-    $paged            = intval($_POST['paged'] ?? 1); // ✅ Fixed from 'page' to 'paged'
+    $paged            = intval($_POST['paged'] ?? 1);
     $search_term      = sanitize_text_field($_POST['search'] ?? '');
     $search_in_acf    = sanitize_text_field($_POST['search_in_acf'] ?? 'no');
+    $search_in_title  = sanitize_text_field($_POST['search_in_title'] ?? 'yes');
+    $search_in_content = sanitize_text_field($_POST['search_in_content'] ?? 'yes');
     $acf_filters      = $_POST['acf'] ?? [];
     $tax_filters      = $_POST['tax'] ?? [];
     $date_from        = sanitize_text_field($_POST['date_from'] ?? '');
@@ -95,34 +112,47 @@ function gpw_filter_posts() {
     $template_id      = sanitize_text_field($_POST['template_id'] ?? '');
     $empty_template_id = sanitize_text_field($_POST['empty_template_id'] ?? '');
 
+    // Create cache key for query caching
+    $cache_key = 'gpw_query_' . md5(serialize([
+        $post_type, $posts_per_page, $paged, $search_term, 
+        $acf_filters, $tax_filters, $date_from, $date_to
+    ]));
+    
+    // Try to get cached result
+    $cached_result = wp_cache_get($cache_key, 'gpw_queries');
+    if ($cached_result !== false) {
+        wp_send_json_success($cached_result);
+        return;
+    }
 
 
     $args = [
         'post_type'      => $post_type,
         'posts_per_page' => $posts_per_page,
-        'paged'          => $paged, // ✅ Proper pagination
+        'paged'          => $paged,
         'post_status'    => 'publish',
+        'no_found_rows'  => false, // We need found_rows for pagination
+        'update_post_meta_cache' => false, // Optimize if not using meta
+        'update_post_term_cache' => false, // Optimize if not using terms
     ];
 
     $meta_query = [];
 
-    // ✅ ACF filters
+    // ACF filters with optimization
     if (!empty($acf_filters)) {
         foreach ($acf_filters as $field_key => $value) {
             if (!empty($value)) {
-                // Handle different ACF field types
                 if (is_array($value)) {
-                    // Multiple values (checkbox, multi-select)
+                    $value = array_map('sanitize_text_field', $value);
                     $meta_query[] = [
                         'key'     => sanitize_key($field_key),
                         'value'   => $value,
                         'compare' => 'IN',
                     ];
                 } else {
-                    // Single value (text, select, radio)
                     $meta_query[] = [
                         'key'     => sanitize_key($field_key),
-                        'value'   => $value,
+                        'value'   => sanitize_text_field($value),
                         'compare' => 'LIKE',
                     ];
                 }
@@ -130,45 +160,44 @@ function gpw_filter_posts() {
         }
     }
 
-// ✅ Taxonomy filters - FIXED VERSION
+    // Optimized taxonomy filters
 if (!empty($tax_filters)) {
     $tax_query = ['relation' => 'AND'];
     
     foreach ($tax_filters as $taxonomy => $terms) {
         if (!empty($terms)) {
-            // Handle both single terms and arrays of terms
             if (is_array($terms)) {
                 $filtered_terms = array_filter($terms, function($term) {
                     return $term !== 'all' && !empty($term);
                 });
+                $filtered_terms = array_map('sanitize_title', $filtered_terms);
             } else {
-                $filtered_terms = ($terms !== 'all' && !empty($terms)) ? [$terms] : [];
+                $filtered_terms = ($terms !== 'all' && !empty($terms)) ? [sanitize_title($terms)] : [];
             }
             
             if (!empty($filtered_terms)) {
                 $tax_query[] = [
                     'taxonomy' => sanitize_key($taxonomy),
                     'field'    => 'slug',
-                    'terms'    => array_map('sanitize_title', $filtered_terms),
+                    'terms'    => $filtered_terms,
                 ];
             }
         }
     }
     
-    // Only add tax_query if we have actual conditions
     if (count($tax_query) > 1) {
         $args['tax_query'] = $tax_query;
     }
 }
 
-    // ✅ Date filters
+    // Optimized date filters
     if ($date_from || $date_to) {
         $date_query = [];
         if ($date_from) {
-            $date_query['after'] = $date_from;
+            $date_query['after'] = sanitize_text_field($date_from);
         }
         if ($date_to) {
-            $date_query['before'] = $date_to;
+            $date_query['before'] = sanitize_text_field($date_to);
         }
         if ($date_query) {
             $date_query['inclusive'] = true;
@@ -177,47 +206,55 @@ if (!empty($tax_filters)) {
     }
 
     if (!empty($meta_query)) {
+        if (count($meta_query) > 1) {
+            $meta_query['relation'] = 'AND';
+        }
         $args['meta_query'] = $meta_query;
     }
 
-
-
-    // ✅ Custom WHERE clause for search
+    // Optimized search functionality
     if (!empty($search_term)) {
-        add_filter('posts_where', function ($where, $query) use ($wpdb, $search_term, $search_in_acf, $post_type) {
+        add_filter('posts_where', function ($where, $query) use ($wpdb, $search_term, $search_in_acf, $search_in_title, $search_in_content, $post_type) {
             if ($query->get('post_type') !== $post_type) {
                 return $where;
             }
 
             $like = '%' . $wpdb->esc_like($search_term) . '%';
+            $search_conditions = [];
 
-            // Search in title + content
-            $where .= $wpdb->prepare(" AND (
-                {$wpdb->posts}.post_title LIKE %s 
-                OR {$wpdb->posts}.post_content LIKE %s",
-                $like, $like
-            );
+            if ($search_in_title === 'yes') {
+                $search_conditions[] = $wpdb->prepare("{$wpdb->posts}.post_title LIKE %s", $like);
+            }
+            
+            if ($search_in_content === 'yes') {
+                $search_conditions[] = $wpdb->prepare("{$wpdb->posts}.post_content LIKE %s", $like);
+            }
 
-            // Also search in ACF fields if enabled
             if ($search_in_acf === 'yes') {
-                $where .= $wpdb->prepare(" 
-                    OR EXISTS (
+                $search_conditions[] = $wpdb->prepare("EXISTS (
                         SELECT 1 FROM {$wpdb->postmeta} pm
                         WHERE pm.post_id = {$wpdb->posts}.ID
                         AND pm.meta_value LIKE %s
-                    )", $like
-                );
+                    )", $like);
             }
 
-            $where .= ")";
+            if (!empty($search_conditions)) {
+                $where .= " AND (" . implode(' OR ', $search_conditions) . ")";
+            }
 
             return $where;
         }, 10, 2);
     }
 
-    // 🔎 Run query
+    // Execute optimized query
     $query = new WP_Query($args);
 
+    // Cache the result
+    $result_data = [
+        'max_pages'    => $query->max_num_pages,
+        'found_posts'  => $query->found_posts,
+        'current_page' => $paged,
+    ];
     ob_start();
 
     if ($query->have_posts()) {
@@ -225,36 +262,30 @@ if (!empty($tax_filters)) {
             $query->the_post();
 
             if ($template_id) {
-                echo \Elementor\Plugin::instance()->frontend->get_builder_content_for_display($template_id);
+                // Use output buffering for better performance
+                echo \Elementor\Plugin::instance()->frontend->get_builder_content_for_display($template_id, false);
             } else {
-                // Fallback basic layout
+                // Optimized fallback layout
                 echo '<div class="gpw-post">';
-                the_post_thumbnail( 'medium', ['loading' => 'lazy'] );
-                echo '<h3>' . get_the_title() . '</h3>';
+                if (has_post_thumbnail()) {
+                    the_post_thumbnail('medium', ['loading' => 'lazy', 'decoding' => 'async']);
+                }
+                echo '<h3><a href="' . get_permalink() . '">' . get_the_title() . '</a></h3>';
+                echo '<div class="gpw-excerpt">' . get_the_excerpt() . '</div>';
                 echo '</div>';
             }
-
         }
 
         wp_reset_postdata();
-
-        $html = ob_get_clean();
-
-        wp_send_json_success([
-            'html'         => $html,
-            'max_pages'    => $query->max_num_pages,
-            'found_posts'  => $query->found_posts,
-            'current_page' => $paged,
-        ]);
+        
+        $result_data['html'] = ob_get_clean();
         
     } else {
-        // Handle empty state with template or default message
+        // Optimized empty state handling
         if ($empty_template_id) {
-            ob_start();
-            echo \Elementor\Plugin::instance()->frontend->get_builder_content_for_display($empty_template_id, true);
-            $empty_html = ob_get_clean();
+            $result_data['html'] = \Elementor\Plugin::instance()->frontend->get_builder_content_for_display($empty_template_id, false);
         } else {
-            $empty_html = '<div class="gpw-no-posts">
+            $result_data['html'] = '<div class="gpw-no-posts">
                 <div class="gpw-no-posts-icon">📭</div>
                 <h3 class="gpw-no-posts-title">No Posts Found</h3>
                 <p class="gpw-no-posts-message">No posts match your current search criteria or filters.</p>
@@ -268,13 +299,17 @@ if (!empty($tax_filters)) {
                 </div>
             </div>';
         }
-
-        wp_send_json_success([
-            'html'         => $empty_html,
-            'max_pages'    => 0,
-            'found_posts'  => 0,
-            'current_page' => $paged,
-        ]);
+        
+        ob_end_clean();
     }
+    
+    // Cache the result for 5 minutes
+    wp_cache_set($cache_key, $result_data, 'gpw_queries', 300);
+    
+    // Re-enable cache addition
+    if (function_exists('wp_suspend_cache_addition')) {
+        wp_suspend_cache_addition(false);
+    }
+    
+    wp_send_json_success($result_data);
 }
-
